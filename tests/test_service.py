@@ -21,13 +21,14 @@ class ServiceTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
         self.service = TrialService(self.connection, self.clock)
+        self.service.bootstrap_first_admin("root", "安全管理员", "local-cli")
         for user_id, role in (
             ("operator", "operator"),
             ("stat", "statistician"),
             ("approver", "approver"),
             ("auditor", "auditor"),
         ):
-            self.service.create_user(user_id, user_id, role)
+            self.service.create_user("root", user_id, user_id, role)
         self.protocol = load_json(ROOT / "fixtures" / "demo_protocol.json")
         self.rows = [
             json.loads(line)

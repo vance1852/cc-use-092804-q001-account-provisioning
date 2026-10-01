@@ -65,8 +65,9 @@ class SupplyServiceTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
         self.service = SupplyService(self.connection, self.clock)
+        self.service.bootstrap_first_admin("root", "安全管理员", "local-cli")
         for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
-            self.service.create_user(user_id, user_id, role)
+            self.service.create_user("root", user_id, user_id, role)
         self.service.create_facility("plan", {"facility_id": "cluster-a", "name": "北部机器人控制平台", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_control_slots": "500000"})
         self.service.create_facility("plan", {"facility_id": "pool-b", "name": "东部推理池", "kind": "inference-pool", "timezone": "Asia/Shanghai", "capacity_control_slots": "800000"})
         self.service.create_route("plan", {"route_id": "fabric-a-b", "origin_id": "cluster-a", "destination_id": "pool-b", "product": "gpu-h100", "daily_capacity": "100000", "loss_basis_points": 25, "transit_hours": 36})

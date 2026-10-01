@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from .errors import ServiceError, ValidationFailed
+from .errors import ServiceError, Unauthorized, ValidationFailed
 from .service import TrialService
 from .storage import connect
 
@@ -25,14 +27,16 @@ class Response:
 class JsonApplication:
     """将 HTTP 路由映射到领域服务，便于无网络单元测试。"""
 
-    def __init__(self, service: TrialService) -> None:
+    def __init__(self, service: TrialService, bootstrap_code: str | None = None) -> None:
         self.service = service
+        # 远程引导注册码：仅当显式配置时 /bootstrap 才开放，且必须与带外预置值一致。
+        self.bootstrap_code = bootstrap_code
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
         actor = headers.get("x-actor-id", "").strip()
         if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
+            raise Unauthorized("缺少 X-Actor-Id，匿名请求不得访问业务接口")
         return actor
 
     @staticmethod
@@ -51,15 +55,46 @@ class JsonApplication:
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
-        path = urlparse(target).path.rstrip("/") or "/"
+        parsed = urlparse(target)
+        path = parsed.path.rstrip("/") or "/"
         parts = [part for part in path.split("/") if part]
+        query = parse_qs(parsed.query)
         try:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
-            if method == "POST" and path == "/users":
-                result = self.service.create_user(payload["user_id"], payload["display_name"], payload["role"])
+            # 首个管理员初始化是唯一允许匿名的账号动作，且只能在系统尚无在职管理员时成功。
+            if method == "POST" and path == "/bootstrap":
+                if not self.bootstrap_code:
+                    return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+                if not hmac.compare_digest(str(payload.get("registration_code", "")), self.bootstrap_code):
+                    raise Unauthorized("初始化注册码无效")
+                result = self.service.bootstrap_first_admin(
+                    payload["user_id"], payload["display_name"], payload["registration_code"],
+                    payload.get("reason", "首个管理员初始化"),
+                )
                 return Response(201, result)
+            actor = self._actor(normalized_headers)
+            if method == "POST" and path == "/users":
+                result = self.service.create_user(
+                    actor, payload["user_id"], payload["display_name"], payload["role"],
+                    payload.get("reason", ""),
+                )
+                return Response(201, result)
+            if method == "GET" and path == "/users":
+                return Response(200, {"users": self.service.list_users(actor)})
+            if method == "GET" and len(parts) == 3 and parts[0] == "users" and parts[2] == "history":
+                return Response(200, self.service.role_history(actor, parts[1]))
+            if method == "GET" and path == "/security/denials":
+                return Response(200, self.service.list_denials(actor, int(query.get("limit", ["100"])[0])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "role":
+                result = self.service.change_role(
+                    actor, parts[1], payload["role"], int(payload["expected_version"]), payload["reason"]
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+                result = self.service.deactivate_user(actor, parts[1], payload["reason"])
+                return Response(200, result)
             if method == "POST" and path == "/robots":
                 result = self.service.register_robot(
                     self._actor(normalized_headers), payload["robot_id"], payload["model_name"], payload["vendor"]
@@ -135,12 +170,21 @@ class JsonApplication:
                 return Response(201, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
+            if exc.status in (401, 403):
+                actor_value = normalized_headers.get("x-actor-id", "").strip() or None
+                try:
+                    self.service.record_denial(actor_value, method, path, exc.code, str(exc))
+                except Exception:  # 拒绝留痕失败不能掩盖原始授权错误
+                    pass
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
 
 def make_handler(application: JsonApplication):
+    # 所有请求线程共享一个 SQLite 连接，必须串行进入服务，避免同一连接上事务交错。
+    gate = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "RobotTrials/1"
 
@@ -153,7 +197,8 @@ def make_handler(application: JsonApplication):
         def _dispatch(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
-            response = application.handle(self.command, self.path, dict(self.headers.items()), body)
+            with gate:
+                response = application.handle(self.command, self.path, dict(self.headers.items()), body)
             encoded = json.dumps(response.body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(response.status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -172,9 +217,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", type=Path, default=Path("embodied_ai.sqlite3"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--bootstrap-code",
+        default="",
+        help="带外预置的首个管理员注册码；提供后才开放远程 POST /bootstrap",
+    )
+    parser.add_argument(
+        "--bootstrap-admin-id",
+        default="",
+        help="在本机直接初始化首个管理员（无需注册码），完成后退出；不与 HTTP 服务同时运行",
+    )
+    parser.add_argument("--bootstrap-admin-name", default="首个管理员")
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    application = JsonApplication(TrialService(connection))
+    if args.bootstrap_admin_id:
+        service = TrialService(connection)
+        try:
+            admin = service.bootstrap_first_admin(
+                args.bootstrap_admin_id, args.bootstrap_admin_name, "local-cli"
+            )
+            print(json.dumps({"bootstrap": "ok", **admin}, ensure_ascii=False))
+        finally:
+            connection.close()
+        return 0
+    application = JsonApplication(TrialService(connection), bootstrap_code=args.bootstrap_code or None)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(application))
     try:
         server.serve_forever()

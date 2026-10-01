@@ -15,11 +15,10 @@ class ComponentService:
         self.db = connect(database)
         self.auth = Auth(self.db)
 
-    def bootstrap_admin(self, user_id: str = "admin", password: str = "component-admin") -> None:
-        try:
-            self.auth.create_user(user_id, password, "admin")
-        except Exception:
-            pass
+    def bootstrap_admin(self, user_id: str, password: str) -> None:
+        """初始化首个质量域管理员；必须显式提供强口令，重复执行不覆盖既有账号。"""
+
+        self.auth.bootstrap_admin(user_id, password)
 
     def create_lot(self, token: str, lot_id: str, product: str, process_rev: str, unit_count: int) -> dict:
         actor = self.auth.require(token, "submit")

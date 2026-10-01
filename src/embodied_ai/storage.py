@@ -5,10 +5,13 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+USER_ROLES = ("operator", "statistician", "approver", "auditor", "admin")
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -33,9 +36,27 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'admin')),
+    role_version INTEGER NOT NULL DEFAULT 1 CHECK (role_version > 0),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS role_assignments (
+    sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('bootstrap', 'created', 'role_changed', 'deactivated')),
+    role TEXT,
+    role_version INTEGER,
+    granted_by TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_role_assignments_user
+ON role_assignments(user_id, sequence_id);
 
 CREATE TABLE IF NOT EXISTS robots (
     robot_id TEXT PRIMARY KEY,
@@ -157,19 +178,34 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS access_denials (
+    denial_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id TEXT,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    code TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_access_denials_time
+ON access_denials(denial_id);
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
-    "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "schema_meta", "protocol_catalog", "users", "role_assignments", "robots", "builds",
+    "batches", "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
+    "analyses", "decisions", "audit_events", "access_denials",
 })
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
     """打开连接并启用严格的事务与外键设置。"""
 
-    connection = sqlite3.connect(str(path), isolation_level=None)
+    # 服务由 ThreadingHTTPServer 每请求一线程驱动；所有写操作都走 BEGIN IMMEDIATE
+    # 显式事务并配合 busy_timeout，因此允许同一连接跨线程串行使用。
+    connection = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -190,10 +226,54 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate_users(connection: sqlite3.Connection) -> None:
+    """把旧版 users 表升级为带授权追踪且包含 admin 角色的结构。
+
+    SQLite 的 ADD COLUMN 无法放宽已有 CHECK 约束，因此按官方 12 步表重建流程：
+    外键检查须在事务外关闭、重建在单事务内完成，历史账号与业务外键原样保留。
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
+    if {"role_version", "created_by", "updated_at"} <= columns:
+        return
+    stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    has_created_at = "created_at" in columns
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute("ALTER TABLE users RENAME TO users_legacy_tmp")
+            connection.execute("""
+                CREATE TABLE users (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'admin')),
+                    role_version INTEGER NOT NULL DEFAULT 1 CHECK (role_version > 0),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                    created_by TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )""")
+            created_at_expr = "created_at" if has_created_at else "?"
+            connection.execute(
+                f"""
+                INSERT INTO users(user_id,display_name,role,role_version,active,created_by,created_at,updated_at)
+                SELECT user_id, display_name, role, 1, active, NULL, {created_at_expr}, {created_at_expr}
+                FROM users_legacy_tmp""",
+                () if has_created_at else (stamp, stamp),
+            )
+            connection.execute("DROP TABLE users_legacy_tmp")
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"用户表迁移发现外键悬挂: {violations!r}")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate_users(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "

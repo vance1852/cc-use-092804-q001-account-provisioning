@@ -33,9 +33,12 @@ def utcnow() -> str:
 
 
 def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db = sqlite3.connect(path)
+    # 服务由 ThreadingHTTPServer 每请求一线程驱动；写操作走显式 BEGIN IMMEDIATE，
+    # 并在 HTTP 层串行进入，因此允许同一连接跨线程使用。
+    db = sqlite3.connect(path, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=5000")
     db.executescript(SCHEMA)
     db.commit()
     return db

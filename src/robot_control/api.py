@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
-from .errors import SupplyError, ValidationFailed
+from .errors import SupplyError, Unauthorized, ValidationFailed
 from .service import SupplyService
 from .storage import connect
 
@@ -22,14 +24,16 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
+    def __init__(self, service: SupplyService, bootstrap_code: str | None = None) -> None:
         self.service = service
+        # 远程引导注册码：仅当显式配置时 /bootstrap 才开放，且必须与带外预置值一致。
+        self.bootstrap_code = bootstrap_code
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
         actor = headers.get("x-actor-id", "").strip()
         if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
+            raise Unauthorized("缺少 X-Actor-Id，匿名请求不得访问业务接口")
         return actor
 
     @staticmethod
@@ -54,9 +58,35 @@ class JsonApplication:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
+            # 首个管理员初始化是唯一允许匿名的账号动作，且只能在系统尚无在职管理员时成功。
+            if method == "POST" and path == "/bootstrap":
+                if not self.bootstrap_code:
+                    return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+                if not hmac.compare_digest(str(payload.get("registration_code", "")), self.bootstrap_code):
+                    raise Unauthorized("初始化注册码无效")
+                result = self.service.bootstrap_first_admin(
+                    payload["user_id"], payload["display_name"], payload["registration_code"],
+                    payload.get("reason", "首个管理员初始化"),
+                )
+                return Response(201, result)
             actor = self._actor(normalized)
             if method == "POST" and path == "/users":
-                return Response(201, self.service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
+                return Response(201, self.service.create_user(
+                    actor, payload["user_id"], payload["display_name"], payload["role"],
+                    payload.get("reason", ""),
+                ))
+            if method == "GET" and path == "/users":
+                return Response(200, {"users": self.service.list_users(actor)})
+            if method == "GET" and len(parts) == 3 and parts[0] == "users" and parts[2] == "history":
+                return Response(200, self.service.role_history(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "role":
+                return Response(200, self.service.change_role(
+                    actor, parts[1], payload["role"], int(payload["expected_version"]), payload["reason"]
+                ))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+                return Response(200, self.service.deactivate_user(actor, parts[1], payload["reason"]))
+            if method == "GET" and path == "/security/denials":
+                return Response(200, self.service.list_denials(actor, int(query.get("limit", ["100"])[0])))
             if method == "POST" and path == "/quotes":
                 return Response(201, self.service.record_quote(actor, payload))
             if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
@@ -87,12 +117,21 @@ class JsonApplication:
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
+            if exc.status in (401, 403):
+                actor_value = normalized.get("x-actor-id", "").strip() or None
+                try:
+                    self.service.record_denial(actor_value, method, path, exc.code, str(exc))
+                except Exception:  # 拒绝留痕失败不能掩盖原始授权错误
+                    pass
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
 
 def make_handler(application: JsonApplication):
+    # 所有请求线程共享一个 SQLite 连接，必须串行进入服务，避免同一连接上事务交错。
+    gate = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "PowerDispatch/1"
 
@@ -105,7 +144,8 @@ def make_handler(application: JsonApplication):
         def _dispatch(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
-            response = application.handle(self.command, self.path, dict(self.headers.items()), body)
+            with gate:
+                response = application.handle(self.command, self.path, dict(self.headers.items()), body)
             encoded = json.dumps(response.body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(response.status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -124,9 +164,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", type=Path, default=Path("robot_control.sqlite3"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--bootstrap-code",
+        default="",
+        help="带外预置的首个管理员注册码；提供后才开放远程 POST /bootstrap",
+    )
+    parser.add_argument(
+        "--bootstrap-admin-id",
+        default="",
+        help="在本机直接初始化首个管理员（无需注册码），完成后退出；不与 HTTP 服务同时运行",
+    )
+    parser.add_argument("--bootstrap-admin-name", default="首个管理员")
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    if args.bootstrap_admin_id:
+        service = SupplyService(connection)
+        try:
+            admin = service.bootstrap_first_admin(
+                args.bootstrap_admin_id, args.bootstrap_admin_name, "local-cli"
+            )
+            print(json.dumps({"bootstrap": "ok", **admin}, ensure_ascii=False))
+        finally:
+            connection.close()
+        return 0
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(JsonApplication(SupplyService(connection), bootstrap_code=args.bootstrap_code or None)),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

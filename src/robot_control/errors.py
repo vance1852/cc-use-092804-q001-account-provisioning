@@ -21,6 +21,11 @@ class Forbidden(SupplyError):
     status = 403
 
 
+class Unauthorized(SupplyError):
+    code = "unauthorized"
+    status = 401
+
+
 class InvalidState(SupplyError):
     code = "invalid_state"
     status = 409

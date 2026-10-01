@@ -10,8 +10,8 @@ from .service import ComponentService
 
 def run() -> dict:
     service = ComponentService()
-    service.bootstrap_admin()
-    token = service.auth.login("admin", "component-admin")
+    service.bootstrap_admin("admin", "component-admin-pass-2026")
+    token = service.auth.login("admin", "component-admin-pass-2026")
     service.create_lot(token, "LOT-DEMO", "CMOS image sensor", "P3.2", 10)
     for signal_frequency, response in ((450, .71), (520, .93), (650, .84)):
         service.add_measurement(token, "LOT-DEMO", signal_frequency, response, .01, "spectrometer-1")

@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import Observation, Protocol, ValidationError
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, Unauthorized, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
@@ -23,7 +23,11 @@ ROLE_PERMISSIONS = {
     },
     "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
     "approver": {"decision.write"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "user.read"},
+    "admin": {
+        "user.create", "user.role.change", "user.deactivate", "user.read",
+        "report.read", "audit.read",
+    },
 }
 
 
@@ -40,10 +44,11 @@ class TrialService:
 
     def _user(self, user_id: str) -> sqlite3.Row:
         row = self.connection.execute(
-            "SELECT user_id, display_name, role, active FROM users WHERE user_id=?", (user_id,)
+            "SELECT user_id, display_name, role, role_version, active FROM users WHERE user_id=?", (user_id,)
         ).fetchone()
         if row is None:
-            raise NotFound(f"用户不存在: {user_id}")
+            # 伪造（系统中不存在）的操作者身份等同未认证，不能获得任何权限。
+            raise Unauthorized(f"身份不存在: {user_id}")
         if not row["active"]:
             raise Forbidden("用户已停用")
         return row
@@ -63,20 +68,223 @@ class TrialService:
             (entity_type, entity_id, event_type, actor_id, canonical_json(payload), self._now()),
         )
 
-    def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
-        if role not in ROLE_PERMISSIONS:
-            raise ValidationFailed(f"未知角色: {role}")
-        if not user_id.strip() or not display_name.strip():
+    def _record_assignment(
+        self, user_id: str, action: str, role: str | None, role_version: int | None,
+        granted_by: str, reason: str,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO role_assignments(user_id,action,role,role_version,granted_by,reason,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (user_id, action, role, role_version, granted_by, reason, self._now()),
+        )
+        self._audit(
+            "user", user_id, f"user.{action}", granted_by,
+            {"role": role, "role_version": role_version, "reason": reason},
+        )
+
+    @staticmethod
+    def _validate_identity(user_id: str, display_name: str) -> str:
+        user_id = user_id.strip()
+        if not user_id or not display_name.strip():
             raise ValidationFailed("用户编号和名称不能为空")
+        return user_id
+
+    def has_admins(self) -> bool:
+        return self.connection.execute(
+            "SELECT 1 FROM users WHERE role='admin' AND active=1 LIMIT 1"
+        ).fetchone() is not None
+
+    def bootstrap_first_admin(
+        self, user_id: str, display_name: str, registration_code: str, reason: str = "首个管理员初始化"
+    ) -> dict[str, Any]:
+        """仅在不存在在职管理员时可引导；重跑幂等返回，绝不覆盖已有账号或历史。"""
+
+        identity = self._validate_identity(user_id, display_name)
+        if not registration_code.strip():
+            raise ValidationFailed("初始化注册码不能为空")
         try:
             with transaction(self.connection, immediate=True):
+                existing = self.connection.execute(
+                    "SELECT role,active FROM users WHERE user_id=?", (identity,)
+                ).fetchone()
+                if existing is not None:
+                    if existing["role"] == "admin" and existing["active"]:
+                        # 初始化重跑：若该管理员确为引导产生则幂等返回，否则拒绝而不是覆盖。
+                        boot = self.connection.execute(
+                            "SELECT 1 FROM role_assignments WHERE user_id=? AND action='bootstrap' LIMIT 1",
+                            (identity,),
+                        ).fetchone()
+                        if boot is not None:
+                            return self.get_user(identity)
+                    raise Conflict("用户已存在，初始化不能覆盖既有账号")
+                if self.connection.execute(
+                    "SELECT 1 FROM users WHERE role='admin' AND active=1 LIMIT 1"
+                ).fetchone() is not None:
+                    raise InvalidState("首个管理员已经存在，初始化不得重复执行")
+                now = self._now()
                 self.connection.execute(
-                    "INSERT INTO users(user_id,display_name,role) VALUES(?,?,?)",
-                    (user_id.strip(), display_name.strip(), role),
+                    "INSERT INTO users(user_id,display_name,role,role_version,active,created_by,created_at,updated_at) "
+                    "VALUES(?,?,'admin',1,1,'system:bootstrap',?,?)",
+                    (identity, display_name.strip(), now, now),
                 )
+                self._record_assignment(identity, "bootstrap", "admin", 1, "system:bootstrap", reason)
         except sqlite3.IntegrityError as exc:
-            raise Conflict(f"用户已存在: {user_id}") from exc
-        return {"user_id": user_id.strip(), "role": role}
+            raise Conflict("初始化与并发账号创建冲突") from exc
+        return self.get_user(identity)
+
+    def create_user(
+        self, actor_id: str, user_id: str, display_name: str, role: str, reason: str = ""
+    ) -> dict[str, Any]:
+        """日常新增账号：仅 admin 可调用；并发同号得到确定的冲突结果。"""
+
+        self._require(actor_id, "user.create")
+        if role not in ROLE_PERMISSIONS:
+            raise ValidationFailed(f"未知角色: {role}")
+        if role == "admin":
+            raise Forbidden("管理员只能通过首个管理员初始化流程产生，不能日常新增")
+        identity = self._validate_identity(user_id, display_name)
+        try:
+            with transaction(self.connection, immediate=True):
+                now = self._now()
+                cursor = self.connection.execute(
+                    "INSERT INTO users(user_id,display_name,role,role_version,active,created_by,created_at,updated_at) "
+                    "VALUES(?,?,?,1,1,?,?,?)",
+                    (identity, display_name.strip(), role, actor_id, now, now),
+                )
+                if cursor.rowcount != 1:
+                    raise Conflict(f"用户已存在: {identity}")
+                self._record_assignment(identity, "created", role, 1, actor_id, reason)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict(f"用户已存在: {identity}") from exc
+        return self.get_user(identity)
+
+    def change_role(
+        self, actor_id: str, user_id: str, new_role: str,
+        expected_version: int, reason: str,
+    ) -> dict[str, Any]:
+        """角色变更：仅 admin，乐观角色版本控制，禁止改自己的角色，失败不留半成品。"""
+
+        self._require(actor_id, "user.role.change")
+        if new_role not in ROLE_PERMISSIONS:
+            raise ValidationFailed(f"未知角色: {new_role}")
+        if not reason.strip():
+            raise ValidationFailed("角色变更必须填写原因")
+        target = self.connection.execute(
+            "SELECT role,role_version,active FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if target is None:
+            raise NotFound(f"用户不存在: {user_id}")
+        if not target["active"]:
+            raise InvalidState("已停用账号必须先重新启用才能变更角色")
+        if user_id == actor_id:
+            raise Forbidden("不能变更自己的角色")
+        if target["role"] == new_role:
+            raise Conflict("账号已经是该角色")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE users SET role=?,role_version=role_version+1,updated_at=? "
+                "WHERE user_id=? AND active=1 AND role_version=?",
+                (new_role, self._now(), user_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict("角色版本已变化，请基于当前版本重试")
+            self._record_assignment(
+                user_id, "role_changed", new_role, expected_version + 1, actor_id, reason
+            )
+        return self.get_user(user_id)
+
+    def deactivate_user(self, actor_id: str, user_id: str, reason: str) -> dict[str, Any]:
+        """停用：仅 admin，禁止停用自己；停用后身份立即不可用于任何业务授权。"""
+
+        self._require(actor_id, "user.deactivate")
+        if not reason.strip():
+            raise ValidationFailed("停用必须填写原因")
+        target = self.connection.execute(
+            "SELECT role,active FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if target is None:
+            raise NotFound(f"用户不存在: {user_id}")
+        if not target["active"]:
+            return self.get_user(user_id)
+        if target["role"] == "admin" and self.connection.execute(
+            "SELECT count(*) FROM users WHERE role='admin' AND active=1"
+        ).fetchone()[0] <= 1:
+            raise InvalidState("不能停用最后一个在职管理员")
+        if user_id == actor_id:
+            raise Forbidden("不能停用自己的账号")
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE users SET active=0,updated_at=? WHERE user_id=? AND active=1",
+                (self._now(), user_id),
+            )
+            version = self.connection.execute(
+                "SELECT role_version FROM users WHERE user_id=?", (user_id,)
+            ).fetchone()["role_version"]
+            self._record_assignment(user_id, "deactivated", None, version, actor_id, reason)
+        return self.get_user(user_id)
+
+    def get_user(self, user_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT user_id,display_name,role,role_version,active,created_by,created_at,updated_at "
+            "FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"用户不存在: {user_id}")
+        return dict(row) | {"active": bool(row["active"])}
+
+    def list_users(self, actor_id: str) -> list[dict[str, Any]]:
+        self._require(actor_id, "user.read")
+        rows = self.connection.execute(
+            "SELECT user_id,display_name,role,role_version,active,created_by,created_at,updated_at "
+            "FROM users ORDER BY user_id"
+        ).fetchall()
+        return [dict(row) | {"active": bool(row["active"])} for row in rows]
+
+    def record_denial(
+        self, actor_id: str | None, method: str, path: str, code: str, reason: str
+    ) -> None:
+        """记录一次授权拒绝；独立写入，业务事务回滚不影响拒绝留痕。"""
+
+        self.connection.execute(
+            "INSERT INTO access_denials(actor_id,method,path,code,reason,created_at) VALUES(?,?,?,?,?,?)",
+            (actor_id, method, path, code, reason[:500], self._now()),
+        )
+
+    def list_denials(self, actor_id: str, limit: int = 100) -> dict[str, Any]:
+        """安全人员查看授权拒绝记录（授权者身份、接口、拒绝原因）。"""
+
+        self._require(actor_id, "audit.read")
+        limit = max(1, min(int(limit), 1000))
+        rows = self.connection.execute(
+            "SELECT denial_id,actor_id,method,path,code,reason,created_at "
+            "FROM access_denials ORDER BY denial_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return {"denials": [dict(row) for row in rows]}
+
+    def role_history(self, actor_id: str, user_id: str) -> dict[str, Any]:
+        """向安全人员暴露授权者、角色版本与动作；仅 admin/auditor 可读。"""
+
+        self._require(actor_id, "audit.read")
+        if self.connection.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone() is None:
+            raise NotFound(f"用户不存在: {user_id}")
+        rows = self.connection.execute(
+            "SELECT sequence_id,action,role,role_version,granted_by,reason,created_at "
+            "FROM role_assignments WHERE user_id=? ORDER BY sequence_id",
+            (user_id,),
+        ).fetchall()
+        current = self.get_user(user_id)
+        return {
+            "user_id": user_id,
+            "current": {
+                "role": current["role"],
+                "role_version": current["role_version"],
+                "active": current["active"],
+                "created_by": current["created_by"],
+            },
+            "assignments": [dict(row) for row in rows],
+        }
 
     def register_robot(
         self, actor_id: str, robot_id: str, model_name: str, vendor: str

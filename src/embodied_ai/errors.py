@@ -21,6 +21,11 @@ class Forbidden(ServiceError):
     status = 403
 
 
+class Unauthorized(ServiceError):
+    code = "unauthorized"
+    status = 401
+
+
 class InvalidState(ServiceError):
     code = "invalid_state"
     status = 409

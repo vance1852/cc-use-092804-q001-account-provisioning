@@ -42,13 +42,27 @@ class Auth:
             active INTEGER NOT NULL DEFAULT 1)""")
         self.db.commit()
 
-    def create_user(self, user_id: str, password: str, role: str = "operator") -> User:
-        if role not in ROLES or len(password) < 8:
-            raise ValueError("invalid role or password")
+    def bootstrap_admin(self, user_id: str, password: str) -> User:
+        """初始化首个管理员；已存在时幂等返回，绝不重置口令或角色，也不吞掉真实故障。"""
+
+        if not user_id.strip():
+            raise ValueError("admin user_id is required")
+        if len(password) < 12:
+            raise ValueError("bootstrap password must be at least 12 characters")
+        existing = self.db.execute(
+            "SELECT role,active FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != "admin" or not existing[1]:
+                raise RuntimeError(f"user {user_id} exists but is not an active admin")
+            return User(user_id, "admin", True)
         salt = secrets.token_hex(16)
-        self.db.execute("INSERT INTO users VALUES(?,?,?,?,1,?)", (user_id, role, salt, _hash(password, salt), datetime.now(timezone.utc).isoformat()))
+        self.db.execute(
+            "INSERT INTO users VALUES(?,?,?,?,1,?)",
+            (user_id, "admin", salt, _hash(password, salt), datetime.now(timezone.utc).isoformat()),
+        )
         self.db.commit()
-        return User(user_id, role, True)
+        return User(user_id, "admin", True)
 
     def login(self, user_id: str, password: str) -> str:
         row = self.db.execute("SELECT role,salt,password_hash,active FROM users WHERE user_id=?", (user_id,)).fetchone()

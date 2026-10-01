@@ -14,8 +14,35 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','admin')),
+    role_version INTEGER NOT NULL DEFAULT 1 CHECK(role_version > 0),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS role_assignments (
+    sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('bootstrap','created','role_changed','deactivated')),
+    role TEXT,
+    role_version INTEGER,
+    granted_by TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_role_assignments_user
+ON role_assignments(user_id, sequence_id);
+
+CREATE TABLE IF NOT EXISTS access_denials (
+    denial_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id TEXT,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    code TEXT NOT NULL,
+    reason TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 
@@ -198,17 +225,59 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # 服务由 ThreadingHTTPServer 每请求一线程驱动；所有写操作都走 BEGIN IMMEDIATE
+    # 显式事务并配合 busy_timeout，因此允许同一连接跨线程串行使用。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
+    # busy_timeout 必须先于 journal_mode：多进程同时初始化全新库时，
+    # WAL 切换需要排队等待而不是立即抛出 database is locked。
+    connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=5000")
     initialize(connection)
     return connection
 
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_supply_users(connection)
+
+
+def _migrate_supply_users(connection: sqlite3.Connection) -> None:
+    """把旧版 supply_users 升级为带授权追踪且包含 admin 角色的结构。
+
+    ADD COLUMN 无法放宽已有 CHECK 约束，按 SQLite 官方表重建流程在单事务内重建；
+    外键检查须在事务外关闭，历史账号与业务外键原样保留。
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(supply_users)").fetchall()}
+    if {"role_version", "created_by", "updated_at"} <= columns:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute("ALTER TABLE supply_users RENAME TO supply_users_legacy_tmp")
+            connection.execute("""
+                CREATE TABLE supply_users (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','admin')),
+                    role_version INTEGER NOT NULL DEFAULT 1 CHECK(role_version > 0),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                    created_by TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )""")
+            connection.execute("""
+                INSERT INTO supply_users(user_id,display_name,role,role_version,active,created_by,created_at,updated_at)
+                SELECT user_id, display_name, role, 1, active, NULL, created_at, created_at
+                FROM supply_users_legacy_tmp""")
+            connection.execute("DROP TABLE supply_users_legacy_tmp")
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"用户表迁移发现外键悬挂: {violations!r}")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 @contextmanager
