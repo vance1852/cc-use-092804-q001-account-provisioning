@@ -47,3 +47,15 @@ PYTHONPATH=src python3 -m component_qualification.api --database component.sqlit
 ```
 
 服务提供 JSON 接口与健康检查。进程重启后可以继续读取 SQLite 中的业务状态和审计历史。
+
+## 账号治理
+
+控制资源域（`robot_control`）与 AI 准入域（`embodied_ai`）的账号建立链路实行显式授权边界：
+
+- `POST /users/bootstrap`：首个管理员初始化，仅在系统从未有过管理员时可用，重跑返回冲突且不覆盖已有账号与历史审计；
+- `POST /users`：日常新增，要求操作者具备 `user.create` 权限（`X-Actor-Id` 必须是真实有效的管理员账号）；
+- `POST /users/{id}/role`：角色变更，要求 `user.role_change` 权限，角色版本（`role_revision`）递增并记录授权者；
+- `POST /users/{id}/deactivate`：停用，要求 `user.deactivate` 权限，停用即刻生效；
+- `GET /users` 与 `GET /users/{id}/audit`：安全审计视角（`audit.read` 权限），可查看每个账号的授权者、角色版本以及全部授权拒绝记录（含伪造身份尝试）。
+
+三类账号权限互不混用，业务角色不具备任何账号管理能力；系统始终保留至少一名可用管理员。所有授权与拒绝事件写入 SQLite 审计表（控制资源域为哈希链），重启后权限与审计保持一致。

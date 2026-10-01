@@ -14,8 +14,10 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','admin')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    role_revision INTEGER NOT NULL DEFAULT 1 CHECK(role_revision > 0),
+    granted_by TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -207,8 +209,51 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return connection
 
 
+def _migrate_supply_users(connection: sqlite3.Connection) -> None:
+    """把早期版本的 supply_users 表重建为含 admin 角色与授权追踪列的结构。
+
+    旧表的 CHECK 约束不含 'admin'，SQLite 无法修改 CHECK，只能整表重建；
+    已有账号原样保留，角色版本从 1 起步，授权者留空表示历史遗留。
+    """
+
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='supply_users'"
+    ).fetchone()
+    if row is None:
+        return
+    columns = {entry[1] for entry in connection.execute("PRAGMA table_info(supply_users)")}
+    if "'admin'" in (row[0] or "") and {"role_revision", "granted_by"} <= columns:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                """CREATE TABLE supply_users_migrated (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','admin')),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                    role_revision INTEGER NOT NULL DEFAULT 1 CHECK(role_revision > 0),
+                    granted_by TEXT,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "INSERT INTO supply_users_migrated(user_id,display_name,role,active,role_revision,granted_by,created_at) "
+                "SELECT user_id,display_name,role,active,1,NULL,created_at FROM supply_users"
+            )
+            connection.execute("DROP TABLE supply_users")
+            connection.execute("ALTER TABLE supply_users_migrated RENAME TO supply_users")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"supply_users 表迁移后外键不一致: {violations!r}")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_supply_users(connection)
 
 
 @contextmanager

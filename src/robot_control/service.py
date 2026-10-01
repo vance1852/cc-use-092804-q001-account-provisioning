@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, SupplyError, ValidationFailed
 from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
 from .planning import (
     AllocationRequest,
@@ -35,6 +35,7 @@ ROLE_PERMISSIONS = {
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
+    "admin": {"user.create", "user.role_change", "user.deactivate"},
 }
 
 
@@ -47,20 +48,32 @@ class SupplyService:
     def _now(self) -> str:
         return utc_text(self.clock.now())
 
+    def _deny(self, user_id: str, permission: str, reason: str, error: type[SupplyError]) -> None:
+        """记录一次授权拒绝（含伪造或缺失身份），随后抛出对应错误。"""
+
+        self._audit(
+            "user",
+            user_id or "(missing)",
+            "auth.denied",
+            user_id or "(missing)",
+            {"permission": permission, "reason": reason},
+        )
+        raise error(reason)
+
     def _user(self, user_id: str) -> sqlite3.Row:
         row = self.connection.execute(
             "SELECT * FROM supply_users WHERE user_id=?", (user_id,)
         ).fetchone()
         if row is None:
-            raise NotFound("用户不存在")
+            self._deny(user_id, "identity", "用户不存在", NotFound)
         if not row["active"]:
-            raise Forbidden("用户已停用")
+            self._deny(user_id, "identity", "用户已停用", Forbidden)
         return row
 
     def _require(self, user_id: str, permission: str) -> sqlite3.Row:
         user = self._user(user_id)
         if permission not in ROLE_PERMISSIONS[user["role"]]:
-            raise Forbidden(f"角色 {user['role']} 无权执行 {permission}")
+            self._deny(user_id, permission, f"角色 {user['role']} 无权执行 {permission}", Forbidden)
         return user
 
     def _audit(
@@ -100,20 +113,135 @@ class SupplyService:
             ),
         )
 
-    def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
+    def bootstrap_admin(self, user_id: str, display_name: str) -> dict[str, Any]:
+        """初始化首个管理员；仅当系统从未有过管理员时可用。
+
+        检查与写入在同一个 IMMEDIATE 事务中完成，并发初始化只有一个能成功；
+        重复执行不会覆盖已有账号或历史审计。
+        """
+
+        if not user_id.strip() or not display_name.strip():
+            raise ValidationFailed("用户编号和名称不能为空")
+        user_id = user_id.strip()
+        try:
+            with transaction(self.connection, immediate=True):
+                if self.connection.execute(
+                    "SELECT 1 FROM supply_users WHERE role='admin' LIMIT 1"
+                ).fetchone():
+                    raise Conflict("管理员已初始化，日常新增须由管理员授权")
+                self.connection.execute(
+                    "INSERT INTO supply_users(user_id,display_name,role,role_revision,granted_by,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (user_id, display_name.strip(), "admin", 1, None, self._now()),
+                )
+                self._audit("user", user_id, "user.bootstrapped", user_id, {"role": "admin", "role_revision": 1})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("用户已经存在") from exc
+        return {"user_id": user_id, "role": "admin", "role_revision": 1, "granted_by": None}
+
+    def create_user(self, actor_id: str, user_id: str, display_name: str, role: str) -> dict[str, Any]:
+        """日常新增账号：仅可由具备 user.create 权限的管理员执行。"""
+
+        self._require(actor_id, "user.create")
         if role not in ROLE_PERMISSIONS:
             raise ValidationFailed("未知角色")
         if not user_id.strip() or not display_name.strip():
             raise ValidationFailed("用户编号和名称不能为空")
+        user_id = user_id.strip()
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
-                    "INSERT INTO supply_users(user_id,display_name,role,created_at) VALUES(?,?,?,?)",
-                    (user_id.strip(), display_name.strip(), role, self._now()),
+                    "INSERT INTO supply_users(user_id,display_name,role,role_revision,granted_by,created_at) "
+                    "VALUES(?,?,?,1,?,?)",
+                    (user_id, display_name.strip(), role, actor_id, self._now()),
                 )
+                self._audit("user", user_id, "user.created", actor_id, {"role": role, "role_revision": 1})
         except sqlite3.IntegrityError as exc:
             raise Conflict("用户已经存在") from exc
-        return {"user_id": user_id.strip(), "role": role}
+        return {"user_id": user_id, "role": role, "role_revision": 1, "granted_by": actor_id}
+
+    def _active_admin_count(self) -> int:
+        return self.connection.execute(
+            "SELECT count(*) FROM supply_users WHERE role='admin' AND active=1"
+        ).fetchone()[0]
+
+    def change_user_role(self, actor_id: str, user_id: str, role: str) -> dict[str, Any]:
+        """角色变更：仅可由具备 user.role_change 权限的管理员执行，角色版本递增。"""
+
+        self._require(actor_id, "user.role_change")
+        if role not in ROLE_PERMISSIONS:
+            raise ValidationFailed("未知角色")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute("SELECT * FROM supply_users WHERE user_id=?", (user_id,)).fetchone()
+            if row is None:
+                raise NotFound("用户不存在")
+            if not row["active"]:
+                raise InvalidState("用户已停用，不能变更角色")
+            if row["role"] == role:
+                raise ValidationFailed("新角色与当前角色相同")
+            if row["role"] == "admin" and self._active_admin_count() <= 1:
+                raise Conflict("至少保留一名可用管理员")
+            new_revision = row["role_revision"] + 1
+            cursor = self.connection.execute(
+                "UPDATE supply_users SET role=?,role_revision=?,granted_by=? WHERE user_id=? AND role_revision=?",
+                (role, new_revision, actor_id, user_id, row["role_revision"]),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict("角色版本已变化，请重试")
+            self._audit(
+                "user",
+                user_id,
+                "user.role_changed",
+                actor_id,
+                {"from_role": row["role"], "to_role": role, "role_revision": new_revision},
+            )
+        return {"user_id": user_id, "role": role, "role_revision": new_revision, "granted_by": actor_id}
+
+    def deactivate_user(self, actor_id: str, user_id: str) -> dict[str, Any]:
+        """停用账号：仅可由具备 user.deactivate 权限的管理员执行，停用即刻生效。"""
+
+        self._require(actor_id, "user.deactivate")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute("SELECT * FROM supply_users WHERE user_id=?", (user_id,)).fetchone()
+            if row is None:
+                raise NotFound("用户不存在")
+            if not row["active"]:
+                raise InvalidState("用户已停用")
+            if row["role"] == "admin" and self._active_admin_count() <= 1:
+                raise Conflict("至少保留一名可用管理员")
+            self.connection.execute("UPDATE supply_users SET active=0 WHERE user_id=?", (user_id,))
+            self._audit(
+                "user",
+                user_id,
+                "user.deactivated",
+                actor_id,
+                {"role": row["role"], "role_revision": row["role_revision"]},
+            )
+        return {"user_id": user_id, "active": False}
+
+    def list_users(self, actor_id: str) -> dict[str, Any]:
+        """安全人员查看账号目录：每个账号的授权者与角色版本。"""
+
+        self._require(actor_id, "audit.read")
+        rows = self.connection.execute(
+            "SELECT user_id,display_name,role,role_revision,active,granted_by,created_at "
+            "FROM supply_users ORDER BY user_id"
+        ).fetchall()
+        return {"users": [dict(row) for row in rows]}
+
+    def user_audit(self, actor_id: str, user_id: str) -> dict[str, Any]:
+        """安全人员查看指定账号的授权与授权拒绝历史。"""
+
+        self._require(actor_id, "audit.read")
+        rows = self.connection.execute(
+            "SELECT event_id,event_type,actor_id,payload_json,created_at FROM supply_audit_events "
+            "WHERE entity_type='user' AND entity_id=? ORDER BY event_id",
+            (user_id,),
+        ).fetchall()
+        return {
+            "user_id": user_id,
+            "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in rows],
+        }
 
     def record_quote(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "quote.write")

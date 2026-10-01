@@ -57,9 +57,25 @@ class JsonApplication:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
-            if method == "POST" and path == "/users":
-                result = self.service.create_user(payload["user_id"], payload["display_name"], payload["role"])
+            if method == "POST" and path == "/users/bootstrap":
+                result = self.service.bootstrap_admin(payload["user_id"], payload["display_name"])
                 return Response(201, result)
+            if method == "POST" and path == "/users":
+                result = self.service.create_user(
+                    self._actor(normalized_headers), payload["user_id"], payload["display_name"], payload["role"]
+                )
+                return Response(201, result)
+            if method == "GET" and path == "/users":
+                return Response(200, self.service.list_users(self._actor(normalized_headers)))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "role":
+                result = self.service.change_user_role(
+                    self._actor(normalized_headers), parts[1], payload["role"]
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+                return Response(200, self.service.deactivate_user(self._actor(normalized_headers), parts[1]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "users" and parts[2] == "audit":
+                return Response(200, self.service.user_audit(self._actor(normalized_headers), parts[1]))
             if method == "POST" and path == "/robots":
                 result = self.service.register_robot(
                     self._actor(normalized_headers), payload["robot_id"], payload["model_name"], payload["vendor"]

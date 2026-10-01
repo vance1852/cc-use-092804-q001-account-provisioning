@@ -54,9 +54,19 @@ class JsonApplication:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
-            actor = self._actor(normalized)
+            if method == "POST" and path == "/users/bootstrap":
+                return Response(201, self.service.bootstrap_admin(payload["user_id"], payload["display_name"]))
             if method == "POST" and path == "/users":
-                return Response(201, self.service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
+                return Response(201, self.service.create_user(self._actor(normalized), payload["user_id"], payload["display_name"], payload["role"]))
+            if method == "GET" and path == "/users":
+                return Response(200, self.service.list_users(self._actor(normalized)))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "role":
+                return Response(200, self.service.change_user_role(self._actor(normalized), parts[1], payload["role"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+                return Response(200, self.service.deactivate_user(self._actor(normalized), parts[1]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "users" and parts[2] == "audit":
+                return Response(200, self.service.user_audit(self._actor(normalized), parts[1]))
+            actor = self._actor(normalized)
             if method == "POST" and path == "/quotes":
                 return Response(201, self.service.record_quote(actor, payload))
             if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:

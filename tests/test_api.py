@@ -30,8 +30,13 @@ class ApiTests(unittest.TestCase):
     def test_user_route(self) -> None:
         payload = json.dumps({"user_id": "u1", "display_name": "操作员", "role": "operator"}).encode()
         response = self.app.handle("POST", "/users", body=payload)
+        self.assertEqual(response.status, 422)
+        self.assertEqual(response.body["error"]["code"], "validation_failed")
+        self.app.handle("POST", "/users/bootstrap", body=json.dumps({"user_id": "root", "display_name": "管理员"}).encode())
+        response = self.app.handle("POST", "/users", {"X-Actor-Id": "root"}, payload)
         self.assertEqual(response.status, 201)
         self.assertEqual(response.body["role"], "operator")
+        self.assertEqual(response.body["granted_by"], "root")
 
 
 if __name__ == "__main__":

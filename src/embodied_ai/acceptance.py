@@ -25,10 +25,11 @@ def run(workspace: Path) -> dict[str, object]:
         connection = connect(database)
         try:
             service = TrialService(connection)
-            service.create_user("operator-1", "测试操作员", "operator")
-            service.create_user("stat-1", "统计负责人", "statistician")
-            service.create_user("approver-1", "分析准入审批人", "approver")
-            service.create_user("auditor-1", "审计人员", "auditor")
+            service.bootstrap_admin("admin-1", "平台管理员")
+            service.create_user("admin-1", "operator-1", "测试操作员", "operator")
+            service.create_user("admin-1", "stat-1", "统计负责人", "statistician")
+            service.create_user("admin-1", "approver-1", "分析准入审批人", "approver")
+            service.create_user("admin-1", "auditor-1", "审计人员", "auditor")
             service.register_robot("operator-1", "robot-a", "A 型人形传感器", "示例厂商")
             service.register_build("operator-1", "build-a1", "robot-a", "1.0.0", "a" * 64)
             service.publish_protocol("stat-1", protocol)
@@ -50,7 +51,7 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",

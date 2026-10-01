@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -33,8 +33,11 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'admin')),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    role_revision INTEGER NOT NULL DEFAULT 1 CHECK (role_revision > 0),
+    granted_by TEXT,
+    created_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS robots (
@@ -190,10 +193,53 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate_users(connection: sqlite3.Connection) -> None:
+    """把早期版本的 users 表重建为含 admin 角色与授权追踪列的结构。
+
+    旧表的 CHECK 约束不含 'admin'，SQLite 无法修改 CHECK，只能整表重建；
+    已有账号原样保留，角色版本从 1 起步，授权者留空表示历史遗留。
+    """
+
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    if row is None:
+        return
+    columns = {entry[1] for entry in connection.execute("PRAGMA table_info(users)")}
+    if "'admin'" in (row[0] or "") and {"role_revision", "granted_by", "created_at"} <= columns:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                """CREATE TABLE users_migrated (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'admin')),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                    role_revision INTEGER NOT NULL DEFAULT 1 CHECK (role_revision > 0),
+                    granted_by TEXT,
+                    created_at TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            connection.execute(
+                "INSERT INTO users_migrated(user_id,display_name,role,active,role_revision,granted_by,created_at) "
+                "SELECT user_id,display_name,role,active,1,NULL,'' FROM users"
+            )
+            connection.execute("DROP TABLE users")
+            connection.execute("ALTER TABLE users_migrated RENAME TO users")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"users 表迁移后外键不一致: {violations!r}")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate_users(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
